@@ -11,16 +11,18 @@ import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * WebSocket endpoint for a collaborative drawing board.
- *
- * This server handles real-time drawing updates from connected clients.
- * It maintains an in-memory list of draw events and broadcasts them to all clients.
- *
+ * WebSocket endpoint for the collaborative drawing board application.
+ * This endpoint manages real-time drawing events from connected clients.
+ * It authenticates clients using one-time tickets, maintains an in-memory draw history,
+ * and broadcasts drawing events to all connected clients.
  * Supported message types:
- * - "draw": Draw event with coordinates, color, and size.
- * - "clear": Clears the canvas and resets the history.
+ * "draw": Draw event with coordinates, color, and size.
+ *  "clear": Clears the canvas and resets the history.
+ *
  */
 @Component
 @ServerEndpoint("/bbService")
@@ -57,10 +59,16 @@ public class BBEndpoint {
     private boolean authenticated = false;
 
     /**
+     * Set de sesiones autenticadas para chat en vivo
+     */
+    private static final Set<Session> authenticatedSessions = ConcurrentHashMap.newKeySet();
+
+    /**
      * Called when a new WebSocket connection is established.
-     * Sends the full draw history to the new client and adds the session to the queue.
+     * Adds the session to the queue. Draw history is sent only after authentication.
      *
      * @param session the session representing the new client connection
+     * @param config the endpoint configuration
      */
     @OnOpen
     public void openConnection(Session session, EndpointConfig config) {
@@ -71,10 +79,9 @@ public class BBEndpoint {
     }
 
     /**
-     * Called when a message is received from a client.
-     * If it's a "draw" event, it adds it to the history.
-     * If it's a "clear" event, it clears the entire history.
-     * In both cases, the message is broadcast to all other clients.
+     * Handles incoming messages from clients.
+     * If not authenticated, expects a ticket as the first message and authenticates the session.
+     * If authenticated, processes "draw" and "clear" events, updates history, and broadcasts to others.
      *
      * @param message the message received (expected to be a JSON string)
      * @param session the session from which the message originated
@@ -82,46 +89,74 @@ public class BBEndpoint {
     @OnMessage
     public void processMessage(String message, Session session) {
         if (!authenticated) {
-            // Espera el ticket como primer mensaje
-            String ticket = extraerTicket(message);
-            String clientIp = session.getRequestURI().getHost(); // Puede requerir ajuste según despliegue
-            if (ticketService != null && ticketService.validateTicket(ticket, clientIp)) {
-                authenticated = true;
-                // Enviar historial tras autenticación
-                for (String event : drawHistory) {
-                    try {
-                        session.getBasicRemote().sendText(event);
-                    } catch (IOException e) {
-                        logger.log(Level.SEVERE, "Error sending past message", e);
-                    }
-                }
-                try {
-                    session.getBasicRemote().sendText("{\"type\":\"info\",\"message\":\"Authenticated.\"}");
-                } catch (IOException ex) {
-                    logger.log(Level.SEVERE, "Error sending connection message", ex);
-                }
-            } else {
-                try {
-                    session.close(new CloseReason(CloseReason.CloseCodes.VIOLATED_POLICY, "Invalid ticket"));
-                } catch (IOException e) {
-                    logger.log(Level.SEVERE, "Error closing session", e);
-                }
-            }
+            handleAuthentication(message, session);
             return;
         }
+
+        if (isChatMessage(message)) {
+            sendChatToAuthenticated(message, session);
+            return;
+        }
+
+        handleDrawingMessage(message);
+        sendToOthers(message);
+    }
+    private void handleAuthentication(String message, Session session) {
+        String ticket = extraerTicket(message);
+        String clientIp = session.getRequestURI().getHost(); // Ajusta si es necesario
+
+        if (ticketService != null && ticketService.validateTicket(ticket, clientIp)) {
+            authenticated = true;
+            authenticatedSessions.add(session);
+            sendDrawHistory(session);
+            sendInfoMessage(session, "Authenticated.");
+        } else {
+            closeSessionWithPolicyViolation(session, "Invalid ticket");
+        }
+    }
+
+    private void sendDrawHistory(Session session) {
+        System.out.println("Enviando historial de dibujo: " + drawHistory.size() + " eventos");
+        for (String event : drawHistory) {
+            try {
+                System.out.println("Enviando evento: " + event);
+                session.getBasicRemote().sendText(event);
+            } catch (IOException e) {
+                logger.log(Level.SEVERE, "Error sending past message", e);
+            }
+        }
+    }
+
+    private void sendInfoMessage(Session session, String message) {
+        try {
+            session.getBasicRemote().sendText("{\"type\":\"info\",\"message\":\"" + message + "\"}");
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Error sending connection message", e);
+        }
+    }
+
+    private void closeSessionWithPolicyViolation(Session session, String reason) {
+        try {
+            session.close(new CloseReason(CloseReason.CloseCodes.VIOLATED_POLICY, reason));
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Error closing session", e);
+        }
+    }
+
+    private boolean isChatMessage(String message) {
+        return message.contains("\"type\":\"chat\"");
+    }
+
+    private void handleDrawingMessage(String message) {
         System.out.println("Message received: " + message);
 
         if (message.contains("\"type\":\"clear\"")) {
-            // Clear the entire drawing history
             drawHistory.clear();
         } else {
-            // Save the draw event in memory
             drawHistory.add(message);
         }
-
-        // Broadcast to other clients
-        sendToOthers(message);
     }
+
 
     /**
      * Called when a WebSocket connection is closed.
@@ -132,6 +167,7 @@ public class BBEndpoint {
     @OnClose
     public void closedConnection(Session session) {
         queue.remove(session);
+        authenticatedSessions.remove(session);
         logger.log(Level.INFO, "Connection closed.");
     }
 
@@ -145,6 +181,7 @@ public class BBEndpoint {
     @OnError
     public void error(Session session, Throwable t) {
         queue.remove(session);
+        authenticatedSessions.remove(session);
         logger.log(Level.SEVERE, "Connection error.", t);
     }
 
@@ -165,14 +202,32 @@ public class BBEndpoint {
         }
     }
 
+    /**
+     * Envía un mensaje de chat solo a los usuarios autenticados (excepto el emisor)
+     */
+    private void sendChatToAuthenticated(String msg, Session sender) {
+        for (Session s : authenticatedSessions) {
+            if (!s.equals(sender)) {
+                try {
+                    s.getBasicRemote().sendText(msg);
+                } catch (IOException e) {
+                    logger.log(Level.WARNING, "Error sending chat message", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * Extracts the ticket value from the initial JSON message.
+     *
+     * @param message the JSON message containing the ticket
+     * @return the extracted ticket string, or null if not found
+     */
     private String extraerTicket(String message) {
         try {
-            // Assuming the message is a JSON string like {"ticket": "your_ticket_here"}
-            // This is a placeholder. In a real application, you'd parse the JSON.
-            // For now, we'll just extract the ticket part.
             int start = message.indexOf("\"ticket\":\"");
             if (start != -1) {
-                int end = message.indexOf("\"", start + 10); // Assuming ticket is 10 chars long
+                int end = message.indexOf("\"", start + 10);
                 if (end != -1) {
                     return message.substring(start + 10, end);
                 }
@@ -181,5 +236,31 @@ public class BBEndpoint {
             logger.log(Level.WARNING, "Error extracting ticket from message", e);
         }
         return null;
+    }
+    /**
+     *
+     */
+    public static void clearDrawHistory() {
+        drawHistory.clear();
+    }
+    public static void addDrawHistory(String event) {
+        drawHistory.add(event);
+    }
+    public static boolean containsDrawHistory(String event) {
+        return drawHistory.contains(event);
+    }
+    public static boolean isDrawHistoryEmpty() {
+        return drawHistory.isEmpty();
+    }
+    public static void clearQueue() {
+        queue.clear();
+    }
+
+    public static void addToQueue(Session session) {
+        queue.add(session);
+    }
+
+    public static boolean queueContains(Session session) {
+        return queue.contains(session);
     }
 }

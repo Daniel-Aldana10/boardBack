@@ -1,0 +1,19 @@
+spring:
+  application:
+    name: demo
+  config:
+    import: optional:file:.env[.properties]
+  security:
+    oauth2:
+      resource server:
+        jwt:
+          issuer-uri: https://accounts.google.com
+
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: 11034
+      password: ${REDIS_PASSWORD}
+      # username: ${REDIS_USERNAME} # Solo si tu Redis lo requiere
+  cache:
+    type: redis
