@@ -3,7 +3,7 @@ package edu.demo.board;
 import jakarta.websocket.*;
 import jakarta.websocket.server.ServerEndpoint;
 import org.springframework.stereotype.Component;
-
+import org.springframework.beans.factory.annotation.Autowired;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -44,6 +44,18 @@ public class BBEndpoint {
      */
     static List<String> drawHistory = new ArrayList<>();
 
+    private static TicketService ticketService;
+
+    @Autowired
+    public void setTicketService(TicketService service) {
+        BBEndpoint.ticketService = service;
+    }
+
+    /**
+     * Almacena si la sesión ya está autenticada
+     */
+    private boolean authenticated = false;
+
     /**
      * Called when a new WebSocket connection is established.
      * Sends the full draw history to the new client and adds the session to the queue.
@@ -51,26 +63,11 @@ public class BBEndpoint {
      * @param session the session representing the new client connection
      */
     @OnOpen
-    public void openConnection(Session session) {
+    public void openConnection(Session session, EndpointConfig config) {
         queue.add(session);
         ownSession = session;
         logger.log(Level.INFO, "Connection opened.");
-
-        // Send full draw history to the new client
-        for (String event : drawHistory) {
-            try {
-                session.getBasicRemote().sendText(event);
-            } catch (IOException e) {
-                logger.log(Level.SEVERE, "Error sending past message", e);
-            }
-        }
-
-        // Optional: send connection confirmation
-        try {
-            session.getBasicRemote().sendText("{\"type\":\"info\",\"message\":\"Connection established.\"}");
-        } catch (IOException ex) {
-            logger.log(Level.SEVERE, "Error sending connection message", ex);
-        }
+        // No enviar historial hasta que esté autenticado
     }
 
     /**
@@ -84,6 +81,34 @@ public class BBEndpoint {
      */
     @OnMessage
     public void processMessage(String message, Session session) {
+        if (!authenticated) {
+            // Espera el ticket como primer mensaje
+            String ticket = extraerTicket(message);
+            String clientIp = session.getRequestURI().getHost(); // Puede requerir ajuste según despliegue
+            if (ticketService != null && ticketService.validateTicket(ticket, clientIp)) {
+                authenticated = true;
+                // Enviar historial tras autenticación
+                for (String event : drawHistory) {
+                    try {
+                        session.getBasicRemote().sendText(event);
+                    } catch (IOException e) {
+                        logger.log(Level.SEVERE, "Error sending past message", e);
+                    }
+                }
+                try {
+                    session.getBasicRemote().sendText("{\"type\":\"info\",\"message\":\"Authenticated.\"}");
+                } catch (IOException ex) {
+                    logger.log(Level.SEVERE, "Error sending connection message", ex);
+                }
+            } else {
+                try {
+                    session.close(new CloseReason(CloseReason.CloseCodes.VIOLATED_POLICY, "Invalid ticket"));
+                } catch (IOException e) {
+                    logger.log(Level.SEVERE, "Error closing session", e);
+                }
+            }
+            return;
+        }
         System.out.println("Message received: " + message);
 
         if (message.contains("\"type\":\"clear\"")) {
@@ -138,5 +163,23 @@ public class BBEndpoint {
                 }
             }
         }
+    }
+
+    private String extraerTicket(String message) {
+        try {
+            // Assuming the message is a JSON string like {"ticket": "your_ticket_here"}
+            // This is a placeholder. In a real application, you'd parse the JSON.
+            // For now, we'll just extract the ticket part.
+            int start = message.indexOf("\"ticket\":\"");
+            if (start != -1) {
+                int end = message.indexOf("\"", start + 10); // Assuming ticket is 10 chars long
+                if (end != -1) {
+                    return message.substring(start + 10, end);
+                }
+            }
+        } catch (Exception e) {
+            logger.log(Level.WARNING, "Error extracting ticket from message", e);
+        }
+        return null;
     }
 }
