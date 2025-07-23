@@ -67,3 +67,7 @@ This project is licensed under the MIT License.
 ![image](images/sonar.png)
 ## Results
 ![image](images/sonar2.png)
+## Sonar
+![image](images/sonarresultado.png)
+## Jacoco
+![image](images/jacoco.png)
